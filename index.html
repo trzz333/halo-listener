@@ -1,0 +1,720 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b0d10">
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-192.png">
+<title>Halo</title>
+<link rel="preconnect" href="https://api.openai.com" crossorigin>
+<link rel="preconnect" href="https://api.anthropic.com" crossorigin>
+<script src="webm-muxer.min.js"></script>
+<style>
+:root { --bg:#0b0d10; --card:#161a20; --ink:#eef1f5; --dim:#8a93a0; --acc:#5eb3ff; --cls:#ffb45e; --bad:#ff6b6b; }
+* { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+html,body { margin:0; height:100%; background:var(--bg); color:var(--ink);
+  font:16px/1.4 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; }
+body { display:flex; flex-direction:column; padding:env(safe-area-inset-top) 14px calc(14px + env(safe-area-inset-bottom)); }
+header { display:flex; align-items:center; gap:10px; padding:12px 0 8px; }
+header h1 { font-size:18px; margin:0; font-weight:650; flex:1; }
+#meter { width:90px; height:8px; background:#222831; border-radius:4px; overflow:hidden; }
+#meter i { display:block; height:100%; width:0; background:var(--acc); transition:width .1s; }
+#buf { color:var(--dim); font-size:13px; min-width:44px; text-align:right; }
+main { flex:1; overflow-y:auto; }
+.card { background:var(--card); border-radius:14px; padding:16px; margin:8px 0; }
+#short { font-size:26px; line-height:1.25; font-weight:650; margin:0 0 10px; }
+#long { color:#c9d0da; margin:0; }
+#tag { font-size:12px; letter-spacing:.08em; text-transform:uppercase; color:var(--dim); margin-bottom:6px; }
+#status { color:var(--dim); min-height:22px; margin:6px 2px; }
+#status.err { color:var(--bad); }
+.row { display:flex; gap:10px; }
+button { font:inherit; border:0; border-radius:14px; color:#0b0d10; font-weight:700; cursor:pointer; }
+button:disabled { opacity:.4; }
+.big { flex:1; height:110px; font-size:22px; }
+.big small { display:block; font-size:13px; font-weight:500; opacity:.75; }
+#conv { background:var(--acc); }  #cls { background:var(--cls); }
+.small { background:#2a313b; color:var(--ink); padding:10px 14px; font-weight:600; }
+#start { width:100%; height:110px; font-size:22px; background:var(--acc); }
+#hist div { padding:8px 0; border-top:1px solid #232933; color:#c9d0da; }
+#hist div:first-child { border-top:0; }
+label { display:flex; align-items:center; gap:8px; color:var(--dim); font-size:14px; }
+select, input[type=password] { width:100%; background:#0f1318; color:var(--ink); border:1px solid #2a313b;
+  border-radius:10px; padding:10px; font:inherit; }
+.hide { display:none !important; }
+/* Controls on top, answer at the bottom of the screen, away from over-the-shoulder eyes. */
+main { display:flex; flex-direction:column; }
+#answer { margin-top:auto; }
+#controls { padding-bottom:4px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Halo</h1>
+  <button id="install" class="small hide" style="padding:6px 12px">Install app</button>
+  <div id="meter"><i></i></div>
+  <span id="buf"></span>
+</header>
+
+<section id="setup" class="card hide">
+  <p style="margin-top:0">Scan the setup code on the laptop with this phone's camera. Or paste the keys:</p>
+  <p><input id="kOpen" type="password" placeholder="OpenAI key" autocomplete="off"></p>
+  <p><input id="kAnth" type="password" placeholder="Anthropic key" autocomplete="off"></p>
+  <button id="saveKeys" class="small">Save</button>
+</section>
+
+<div id="controls">
+  <button id="start" class="hide">Start listening</button>
+  <div class="row hide" id="triggers">
+    <button id="conv" class="big">Conversation<small>last 20 s</small></button>
+    <button id="cls" class="big">Class<small>last 90 s</small></button>
+  </div>
+</div>
+
+<main id="app" class="hide">
+  <div id="status"></div>
+  <div class="card">
+    <p style="margin:0 0 8px"><select id="mic"></select></p>
+    <label><input type="checkbox" id="local"> Transcribe on this phone (private, no API cost) <span id="localState"></span></label>
+    <label><input type="checkbox" id="speak"> Read answers aloud</label>
+  </div>
+  <div class="card" id="histCard" style="display:none"><div id="hist"></div></div>
+  <div class="card" id="answer">
+    <div id="tag">Ready</div>
+    <p id="short">Tap a button right after something is said.</p>
+    <p id="long"></p>
+    <div class="row" style="margin-top:12px">
+      <button id="copy" class="small hide">Copy</button>
+      <button id="again" class="small hide">Speak</button>
+    </div>
+  </div>
+</main>
+
+<audio id="silent" loop playsinline></audio>
+
+<script>
+"use strict";
+// Retroactive listener. Audio lives only in this page's memory; it leaves the
+// phone only when a button is tapped, and only the tapped window.
+const SR = 16000, RING_S = 120, CONV_S = 20, CLASS_S = 90;
+const FLOOR = 0.35, CHAIN_S = 300, SILENT_DBFS = -55;
+// gpt-4o-transcribe over -mini: on phone-mic replays it missed 17-22% of words vs 51-54% (tools/stt_bench/mic_check.py).
+const STT_MODEL = "gpt-4o-transcribe";
+const LLM = "claude-haiku-4-5-20251001";
+const $ = id => document.getElementById(id);
+
+const SYSTEM = `You are a retroactive listener inside a pair of smart glasses.
+You receive a transcript of the last seconds of audio the wearer just heard.
+It is mid-stream: it starts and ends abruptly, and ASR errors are common.
+
+Emit exactly one reaction to what just happened. Pick the type this way:
+- If the window contains a question put to the room, type is "answer" and you
+  answer it. Commit to the answer. Do not reply with the question restated, do
+  not list what the answer depends on, do not say what to consider. A wearer
+  who is being asked something needs the answer, not the issue spotted.
+- Only if no question was asked: type is "question" when the useful move is
+  asking the thing nobody asked, or "statement" for a fact, correction, or
+  name the wearer would want surfaced.
+
+Rules: no preamble, no hedging, no restating the transcript. Assume the wearer
+heard it. If the window is noise, chatter, or too fragmentary to react to, set
+confidence below 0.3 and keep it brief. Confidence is your probability that
+this reaction is worth interrupting the wearer for.
+
+Reply with JSON only, fields in this order:
+{"asked": true|false, "type":..., "confidence":..., "short":..., "long":...}
+asked: was a question put to the room in this window? Decide this first.
+short: <=15 words, readable at a glance on a lens. If it is an answer, the
+answer itself goes here, not a pointer to it.
+long: <=60 words, the version with the reasoning in it.`;
+
+const MODE_HINT = {
+  conversation: "Mode: conversation, close-talk, two or more people. React as the thing the wearer would want to say next.",
+  class: "Mode: lecture, far-field, mostly one speaker. If the instructor asked something, give the answer the wearer could say out loud. Otherwise surface the point worth writing down.",
+};
+
+// ---------- keys: arrive once via #k=<base64url json> from the laptop QR ----------
+function loadKeys() {
+  const m = location.hash.match(/k=([A-Za-z0-9_-]+)/);
+  if (m) {
+    try {
+      const j = JSON.parse(atob(m[1].replace(/-/g, "+").replace(/_/g, "/")));
+      if (j.o && j.a) localStorage.setItem("halo.keys", JSON.stringify(j));
+    } catch (e) {}
+    history.replaceState(null, "", location.pathname);  // key never lingers in the URL
+  }
+  try { return JSON.parse(localStorage.getItem("halo.keys") || "null"); } catch (e) { return null; }
+}
+let KEYS = loadKeys();
+
+// ---------- ring buffer: last RING_S seconds, int16, memory only ----------
+const ring = new Int16Array(SR * RING_S);
+let wpos = 0, filled = 0;
+let total = 0;                 // absolute samples written since the page opened
+let fSq = 0, fN = 0;           // current 200 ms frame, for the segmenter
+function push(f32) {
+  for (let i = 0; i < f32.length; i++) {
+    const s = Math.max(-1, Math.min(1, f32[i]));
+    ring[wpos] = s < 0 ? s * 32768 : s * 32767;
+    wpos = (wpos + 1) % ring.length;
+    total++; filled = Math.min(ring.length, filled + 1);
+    fSq += s * s;
+    if (++fN === FRAME) { const r = Math.sqrt(fSq / FRAME); fSq = 0; fN = 0; onFrame(r, total); }
+  }
+}
+function pcmAt(a, b) {         // absolute sample range [a, b) out of the ring
+  const n = b - a, out = new Int16Array(n);
+  let p = ((wpos - (total - a)) % ring.length + ring.length) % ring.length;
+  for (let i = 0; i < n; i++) { out[i] = ring[p]; p = (p + 1) % ring.length; }
+  return out;
+}
+function tail(secs) {
+  const n = Math.min(filled, Math.round(secs * SR));
+  const out = new Int16Array(n);
+  let p = (wpos - n + ring.length) % ring.length;
+  for (let i = 0; i < n; i++) { out[i] = ring[p]; p = (p + 1) % ring.length; }
+  return out;
+}
+function clearRing() { ring.fill(0); wpos = 0; filled = 0; resetSegs(); }
+function dbfs(pcm) {
+  let s = 0;
+  for (let i = 0; i < pcm.length; i++) s += pcm[i] * pcm[i];
+  return 20 * Math.log10(Math.sqrt(s / Math.max(1, pcm.length)) / 32768 + 1e-9);
+}
+function wav(pcm) {
+  const b = new ArrayBuffer(44 + pcm.length * 2), v = new DataView(b);
+  const str = (o, t) => { for (let i = 0; i < t.length; i++) v.setUint8(o + i, t.charCodeAt(i)); };
+  str(0, "RIFF"); v.setUint32(4, 36 + pcm.length * 2, true); str(8, "WAVE");
+  str(12, "fmt "); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, SR, true); v.setUint32(28, SR * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+  str(36, "data"); v.setUint32(40, pcm.length * 2, true);
+  new Int16Array(b, 44).set(pcm);
+  return new Blob([b], { type: "audio/wav" });
+}
+
+// ---------- on-phone rolling transcript ----------
+// The ring is cut at pauses as it fills (after 2.5 s at a clearly quiet 200 ms frame, else at 6 s
+// at the quietest frame seen). A piece is transcribed once the next piece has closed: Parakeet
+// gets 10 s of left context and up to 4 s of the next piece as right context, and keeps only
+// the piece's own words. On the S23 that scored 2-15% WER on phone-mic replays, against 24-54%
+// for bare pieces (tools/device_app_stt.py). A tap transcribes the uncommitted end (the last
+// closed piece plus the open tail) as one job. Text lives in memory like the audio.
+const FRAME = 3200, SEG_MIN = SR * 2.5, SEG_MAX = SR * 6, SEG_SILENT_RMS = 0.004, LOCAL_WAIT_MS = 4500;
+const CTX = SR * 10, LOOKAHEAD = SR * 4, TAP_MAX = SR * 32;   // the encoder covers ~35 s
+let segStart = 0, fSum = 0, fCount = 0, segId = 0;
+let stt = null, sttState = "off", sttNote = "", sttInfo = {};
+const segs = [];               // {id, start, end, text: string|null, silent, failed}
+const waiters = new Set(), tapWait = new Map();
+
+function useLocal() { return sttState === "ready" && $("local").checked; }
+function resetSegs() {
+  segs.length = 0; segStart = total; fSum = 0; fCount = 0;
+  if (stt) stt.postMessage({ kind: "clear" });
+  for (const r of tapWait.values()) r(null);
+  tapWait.clear();
+  wake();
+}
+function wake() { for (const w of [...waiters]) w(); }
+
+// Phone AGC lifts pauses close to speech level, so a fixed quiet threshold rarely
+// fires. Cut early only on a clearly quiet frame; otherwise at the limit, cut at the
+// quietest frame seen since SEG_MIN (a pause in the past), never mid-word at the limit.
+let bestR = Infinity, bestAt = 0;
+function onFrame(r, end) {
+  fSum += r; fCount++;
+  const len = end - segStart;
+  if (len < SEG_MIN) return;
+  if (r < bestR) { bestR = r; bestAt = end - FRAME / 2; }
+  if (r < Math.max(0.003, 0.2 * fSum / fCount)) closeSeg(end - FRAME / 2);
+  else if (len >= SEG_MAX) closeSeg(bestAt);
+}
+
+function f32(a, b) {
+  const p = pcmAt(a, b), f = new Float32Array(p.length);
+  for (let i = 0; i < p.length; i++) f[i] = p[i] / 32768;
+  return f;
+}
+function oldest() { return total - filled; }
+function send(id, a, e, from, to, urgent) {
+  const f = f32(a, e);
+  stt.postMessage({ kind: "seg", id, start: from, end: to || e, pcm: f, urgent,
+                    skip: (from - a) / SR, until: to ? (to - a) / SR : 0 }, [f.buffer]);
+}
+
+function closeSeg(cut) {
+  const a = segStart;
+  segStart = cut; fSum = 0; fCount = 0; bestR = Infinity;
+  if (cut - a < SR / 4) return;
+  while (segs.length && segs[0].end < total - SR * RING_S) segs.shift();
+  const f = f32(a, cut);
+  let sq = 0;
+  for (let i = 0; i < f.length; i++) sq += f[i] * f[i];
+  const silent = Math.sqrt(sq / f.length) < SEG_SILENT_RMS;
+  const prev = segs[segs.length - 1];
+  segs.push({ id: 0, start: a, end: cut, text: silent ? "" : null, silent });
+  if (prev) commit(prev, cut);
+}
+// Silent pieces count as covered; untranscribed speech marks the window as not local.
+function commit(s, nextEnd) {
+  if (s.text !== null || s.id) return;
+  if (!stt || !$("local").checked || sttState === "fail") { s.text = ""; s.failed = true; return; }
+  s.id = ++segId;
+  send(s.id, Math.max(s.start - CTX, oldest()), Math.min(nextEnd, s.end + LOOKAHEAD), s.start, s.end, false);
+}
+
+function startLocal() {
+  if (stt || !navigator.gpu || !window.Worker) {
+    if (!navigator.gpu) { sttState = "none"; sttNote = "not supported on this browser"; }
+    renderLocal(); return;
+  }
+  // ?models=<base url> points the worker at another copy of the model files (device tests).
+  const mb = new URLSearchParams(location.search).get("models");
+  try { stt = new Worker("stt-worker.js" + (mb ? "?m=" + encodeURIComponent(mb) : ""), { type: "module" }); }
+  catch (e) { sttState = "fail"; sttNote = String(e.message || e); renderLocal(); return; }
+  try { navigator.storage && navigator.storage.persist && navigator.storage.persist(); } catch (e) {}
+  sttState = "loading"; sttNote = "loading";
+  stt.onmessage = e => {
+    const m = e.data;
+    if (m.kind === "progress") sttNote = m.note || ("downloading " + m.pct + "% of 1.3 GB");
+    else if (m.kind === "ready") { sttState = "ready"; sttNote = "ready"; sttInfo = m; }
+    else if (m.kind === "fail") { sttState = "fail"; sttInfo.fail = m.error; sttNote = "unavailable (" + m.error.slice(0, 60) + ")"; wake(); }
+    else if (m.kind === "dropped") dropped = new Set(m.ids);
+    else if (m.kind === "restart") {   // fresh download done: a clean worker loads from cache
+      stt.terminate(); stt = null; sttState = "off";
+      startLocal();
+      segs.forEach((s, k) => { if (s.id && s.text === null && k + 1 < segs.length) { s.id = 0; commit(s, segs[k + 1].end); } });
+      return;
+    }
+    else if (m.kind === "seg" || m.kind === "segerr") {
+      if (tapWait.has(m.id)) { const r = tapWait.get(m.id); tapWait.delete(m.id); r(m); return; }
+      const s = segs.find(x => x.id === m.id);
+      if (s) { s.text = m.kind === "seg" ? m.text : ""; s.cost = [m.audio, m.enc, m.dec]; }
+      if (m.kind === "segerr") { if (s) s.failed = true; sttInfo.lastErr = m.error; }
+      wake();
+    }
+    renderLocal();
+  };
+  stt.onerror = e => { sttState = "fail"; sttNote = "worker error"; sttInfo.workerError = String(e.message || e); renderLocal(); wake(); };
+  renderLocal();
+}
+function renderLocal() {
+  const el = $("localState");
+  if (el) el.textContent = sttNote ? "(" + sttNote + ")" : "";
+}
+
+// Text for the last `secs` seconds, or null when the phone can't vouch for all of it.
+async function localTranscript(secs) {
+  if (!useLocal()) return null;
+  const from = Math.max(total - Math.round(secs * SR), oldest());
+  const win = segs.filter(s => s.end > from);
+  if (win.some(s => s.failed)) return null;
+  // Everything before the first piece without text is done; the rest goes in one tap job.
+  const i = win.findIndex(s => s.text === null);
+  const done = i < 0 ? win : win.slice(0, i);
+  const rest = i < 0 ? [] : win.slice(i);
+  const tapFrom = rest.length ? rest[0].start : segStart;
+  if (total - tapFrom > TAP_MAX) return null;
+  if ((done[0] || rest[0] || { start: tapFrom }).start > from + SR) return null;   // window must be covered
+  // Their queued commit jobs would only delay the tap job; drop them and requeue afterwards.
+  const queued = rest.filter(s => s.id).map(s => s.id);
+  dropped = new Set();
+  if (queued.length) stt.postMessage({ kind: "drop", ids: queued });
+  let tail = "";
+  if (total - tapFrom >= SR / 4) {
+    const id = ++segId;
+    const m = await new Promise(res => {
+      tapWait.set(id, res);
+      setTimeout(() => { if (tapWait.delete(id)) res(null); }, LOCAL_WAIT_MS);
+      send(id, Math.max(tapFrom - CTX, oldest(), total - TAP_MAX), total, tapFrom, 0, true);
+    });
+    lastTap = m && { audio: m.audio, enc: m.enc, dec: m.dec, sec: m.sec };
+    for (const s of rest) {           // requeue what the worker dropped (an in-flight one still lands)
+      if (s.text !== null || !dropped.has(s.id)) continue;
+      const k = segs.indexOf(s);
+      if (k >= 0 && k + 1 < segs.length) { s.id = 0; commit(s, segs[k + 1].end); }
+    }
+    if (!m || m.kind !== "seg") return null;
+    tail = m.text;
+  }
+  return [...done.map(s => s.text), tail].filter(Boolean).join(" ").trim();
+}
+let lastTap = null, dropped = new Set();
+
+// ---------- capture ----------
+const WORKLET = `class Tap extends AudioWorkletProcessor {
+  process(inputs) { const c = inputs[0] && inputs[0][0]; if (c) this.port.postMessage(c.slice(0)); return true; }
+}
+registerProcessor("tap", Tap);`;
+let ctx = null, stream = null, level = -99, wakeLock = null;
+
+// Chrome honours a 16 kHz AudioContext; if a browser doesn't, downsample here.
+let resampleCarry = 0;
+function toSR(f32, rate) {
+  if (rate === SR) return f32;
+  const step = rate / SR, out = [];
+  let t = resampleCarry;
+  for (; t < f32.length; t += step) out.push(f32[Math.floor(t)]);
+  resampleCarry = t - f32.length;
+  return Float32Array.from(out);
+}
+
+async function startAudio() {
+  const id = $("mic").value;
+  const audio = { channelCount: 1, echoCancellation: false, autoGainControl: true, noiseSuppression: false };
+  if (id) audio.deviceId = { exact: id };
+  stream = await navigator.mediaDevices.getUserMedia({ audio });
+  if (!ctx) {
+    try { ctx = new AudioContext({ sampleRate: SR }); } catch (e) { ctx = new AudioContext(); }
+    await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([WORKLET], { type: "text/javascript" })));
+  }
+  await ctx.resume();
+  const src = ctx.createMediaStreamSource(stream);
+  const node = new AudioWorkletNode(ctx, "tap");
+  const mute = ctx.createGain(); mute.gain.value = 0;
+  src.connect(node); node.connect(mute); mute.connect(ctx.destination);
+  node.port.onmessage = e => {
+    const f = toSR(e.data, ctx.sampleRate);
+    push(f);
+    let s = 0; for (let i = 0; i < f.length; i++) s += f[i] * f[i];
+    level = 20 * Math.log10(Math.sqrt(s / Math.max(1, f.length)) + 1e-9);
+  };
+  stream.getAudioTracks()[0].addEventListener("ended", () => status("Microphone disconnected. Tap Start.", true));
+  await listMics();
+}
+
+async function listMics() {
+  const sel = $("mic"), cur = sel.value;
+  const devs = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === "audioinput");
+  sel.innerHTML = "";
+  for (const d of devs) {
+    const o = document.createElement("option");
+    o.value = d.deviceId; o.textContent = d.label || "Microphone";
+    sel.appendChild(o);
+  }
+  const live = stream && stream.getAudioTracks()[0].getSettings().deviceId;
+  sel.value = live || cur || "";
+}
+
+async function switchMic() {
+  if (!stream) return;
+  stream.getTracks().forEach(t => t.stop());
+  clearRing();
+  await startAudio();
+  status("Switched microphone. Buffer restarted.");
+}
+
+async function keepAwake() {
+  try { wakeLock = await navigator.wakeLock.request("screen"); } catch (e) {}
+}
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && stream) keepAwake();
+});
+
+// Headset/media button: play/pause = conversation, next track = class.
+// Needs a (silent) media element playing so the phone routes the button here.
+function silentWavURL() {
+  return URL.createObjectURL(wav(new Int16Array(SR)));
+}
+function armMediaButtons() {
+  const a = $("silent");
+  a.src = silentWavURL(); a.volume = 0.01;
+  a.play().catch(() => {});
+  if (!("mediaSession" in navigator)) return;
+  const conv = () => { a.play().catch(() => {}); trigger("conversation"); };
+  for (const act of ["play", "pause"]) {
+    try { navigator.mediaSession.setActionHandler(act, conv); } catch (e) {}
+  }
+  try { navigator.mediaSession.setActionHandler("nexttrack", () => trigger("class")); } catch (e) {}
+  navigator.mediaSession.metadata = new MediaMetadata({ title: "Halo listening", artist: "tap to react" });
+}
+
+// ---------- pipeline: window -> transcript -> one reaction ----------
+let busy = false, last = { t: 0, text: "" }, lastReact = null, lastRun = null;
+const session = [];
+
+function fit(text, limit) {
+  const w = String(text || "").split(/\s+/).filter(Boolean);
+  if (w.length <= limit) return w.join(" ");
+  const kept = w.slice(0, limit).join(" ");
+  const end = Math.max(kept.lastIndexOf(". "), kept.lastIndexOf("! "), kept.lastIndexOf("? "));
+  return end > 0 ? kept.slice(0, end + 1) : kept;
+}
+
+// Opus in WebM is ~10x smaller than WAV; falls back to WAV where WebCodecs is missing.
+async function encodeOpus(pcm) {
+  if (!window.AudioEncoder || !window.WebMMuxer) return null;
+  const cfg = { codec: "opus", sampleRate: SR, numberOfChannels: 1, bitrate: 24000 };
+  if (!(await AudioEncoder.isConfigSupported(cfg)).supported) return null;
+  const muxer = new WebMMuxer.Muxer({ target: new WebMMuxer.ArrayBufferTarget(),
+    audio: { codec: "A_OPUS", numberOfChannels: 1, sampleRate: SR } });
+  let fail = null;
+  const enc = new AudioEncoder({ output: (c, m) => muxer.addAudioChunk(c, m), error: e => { fail = e; } });
+  enc.configure(cfg);
+  for (let i = 0; i < pcm.length; i += SR) {
+    const part = pcm.slice(i, i + SR);
+    enc.encode(new AudioData({ format: "s16", sampleRate: SR, numberOfChannels: 1,
+      numberOfFrames: part.length, timestamp: Math.round(i * 1e6 / SR), data: part }));
+  }
+  await enc.flush(); enc.close();
+  if (fail) throw fail;
+  muxer.finalize();
+  return new Blob([muxer.target.buffer], { type: "audio/webm" });
+}
+let lastUpload = "";
+async function transcribe(pcm) {
+  const fd = new FormData();
+  let opus = null;
+  try { opus = await encodeOpus(pcm); } catch (e) { opus = null; }
+  lastUpload = opus ? "webm" : "wav";
+  if (opus) fd.append("file", opus, "window.webm");
+  else fd.append("file", wav(pcm), "window.wav");
+  fd.append("model", STT_MODEL);
+  fd.append("language", "en");
+  // gpt-4o-transcribe intermittently drops the end of the audio after a pause (OpenAI forum,
+  // Oct 2025; 4 of 6 calls on one S23 replay, 2026-09-16). Two identical requests race: the
+  // first one answers, and `later` hands back the other so the caller can correct a cut-off.
+  const one = async () => {
+    const r = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+      method: "POST", headers: { Authorization: "Bearer " + KEYS.o }, body: fd,
+    });
+    if (!r.ok) throw new Error("transcription " + r.status + ": " + (await r.text()).slice(0, 120));
+    return ((await r.json()).text || "").trim();
+  };
+  const reqs = [one(), one()];
+  const first = await Promise.any(reqs.map((p, i) => p.then(text => ({ text, i }))))
+    .catch(e => { throw (e.errors && e.errors[0]) || e; });
+  const later = reqs[1 - first.i].catch(() => null);
+  return { text: first.text, later };
+}
+const words = s => (s || "").split(/\s+/).filter(Boolean).length;
+// The other request is clearly longer: the first one was cut off.
+const cutOff = (a, b) => words(b) >= words(a) + 5 && words(b) >= 1.25 * words(a);
+
+function partial(acc, key, re) {
+  const m = acc.match(new RegExp('"' + key + '"\\s*:\\s*' + re));
+  return m ? m[1] : null;
+}
+async function react(text, mode, prior, onShort) {
+  let body = MODE_HINT[mode];
+  if (prior) body += "\n\nEarlier in the same conversation (context only, do not react to this part):\n" + prior;
+  body += "\n\nTranscript:\n" + text;
+  const r = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-api-key": KEYS.a,
+      "anthropic-version": "2023-06-01",
+      "anthropic-dangerous-direct-browser-access": "true",
+    },
+    body: JSON.stringify({ model: LLM, max_tokens: 300, temperature: 0, system: SYSTEM, stream: true,
+                           messages: [{ role: "user", content: body }] }),
+  });
+  if (!r.ok) throw new Error("model " + r.status + ": " + (await r.text()).slice(0, 120));
+  // Server-sent events: surface the short answer as soon as it is complete.
+  const reader = r.body.getReader(), dec = new TextDecoder();
+  let buf = "", raw = "", sent = false;
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    let nl;
+    while ((nl = buf.indexOf("\n")) >= 0) {
+      const line = buf.slice(0, nl).trim(); buf = buf.slice(nl + 1);
+      if (!line.startsWith("data:")) continue;
+      let ev; try { ev = JSON.parse(line.slice(5)); } catch (e) { continue; }
+      if (ev.type === "error") throw new Error("model: " + (ev.error && ev.error.message));
+      if (ev.type !== "content_block_delta" || !ev.delta || typeof ev.delta.text !== "string") continue;
+      raw += ev.delta.text;
+      if (!sent && onShort) {
+        const s = partial(raw, "short", '"((?:[^"\\\\]|\\\\.)*)"');
+        if (s !== null) {
+          sent = true;
+          const asked = partial(raw, "asked", "(true|false)") === "true";
+          const conf = Number(partial(raw, "confidence", "([0-9.]+)") || 0);
+          let short = s; try { short = JSON.parse('"' + s + '"'); } catch (e) {}
+          onShort({ type: asked ? "answer" : (partial(raw, "type", '"(\\w+)"') || "statement"),
+                    short: fit(short, 15), confidence: conf });
+        }
+      }
+    }
+  }
+  const m = raw.match(/\{[\s\S]*\}/);
+  if (!m) throw new Error("unparseable reply");
+  const d = JSON.parse(m[0]);
+  return { type: d.asked === true ? "answer" : String(d.type || "statement"), short: fit(d.short, 15), long: fit(d.long, 60),
+           confidence: Number(d.confidence) || 0 };
+}
+
+async function trigger(mode) {
+  if (!stream) return;
+  if (busy) { status("Still working on the last one."); return; }
+  const secs = mode === "class" ? CLASS_S : CONV_S;
+  const pcm = tail(secs);
+  if (navigator.vibrate) navigator.vibrate(30);
+  if (pcm.length < SR) { status("Not enough audio yet."); return; }
+  if (dbfs(pcm) < SILENT_DBFS) { status("Nothing audible in that window."); return; }
+  busy = true; setButtons();
+  const t0 = performance.now();
+  status((mode === "class" ? "Class" : "Conversation") + ": listening back " + Math.round(pcm.length / SR) + " s...");
+  try {
+    let text = null, how = "phone", later = null;
+    try { text = await localTranscript(secs); } catch (e) { text = null; }
+    if (!text) { ({ text, later } = await transcribe(pcm)); how = lastUpload; }   // cloud: fallback and when the phone heard nothing
+    if (!text && later) { text = await later; later = null; }
+    const tHeard = performance.now();
+    if (!text) { status("Nothing audible in that window."); return; }
+    const prior = (Date.now() - last.t) / 1000 < CHAIN_S ? last.text : null;
+    const sec = x => ((x - t0) / 1000).toFixed(1);
+    const answer = async (text, fixed) => {
+      status((fixed ? "Transcript was cut off, re-reading: " : "Heard: ") + text.slice(0, 140) + (text.length > 140 ? "..." : ""));
+      let tShort = 0;
+      const r = await react(text, mode, prior, p => {
+        if (p.confidence < FLOOR) return;
+        tShort = performance.now();
+        $("tag").textContent = p.type + " \u00b7 " + mode;
+        $("short").textContent = p.short;
+        $("long").textContent = "";
+        if (navigator.vibrate) navigator.vibrate(fixed ? [20, 40, 20, 40, 20] : [40, 60, 40]);
+      });
+      last = { t: Date.now(), text };
+      lastRun = { how, text, heard: (tHeard - t0) / 1000, short: r.short, conf: r.confidence, fixed: !!fixed };
+      if (r.confidence < FLOOR) { status("Nothing worth saying about that one."); return; }
+      show(r, mode);
+      status("answer at " + sec(tShort || performance.now()) + " s \u00b7 heard " + sec(tHeard) + " s (" + how + ")" +
+             (fixed ? " \u00b7 corrected a cut-off transcript" : "") + " \u00b7 done " + sec(performance.now()) + " s");
+      try { await navigator.clipboard.writeText(r.long); } catch (e) {}
+      if ($("speak").checked) say(r.short);
+    };
+    await answer(text, false);
+    if (later) {
+      const other = await Promise.race([later, new Promise(r => setTimeout(() => r(null), 6000))]);
+      if (other && cutOff(text, other)) await answer(other, true);
+    }
+  } catch (e) {
+    status(String(e.message || e), true);
+  } finally {
+    busy = false; setButtons();
+  }
+}
+
+// ---------- UI ----------
+function status(msg, err) { const s = $("status"); s.textContent = msg; s.className = err ? "err" : ""; }
+function setButtons() { $("conv").disabled = $("cls").disabled = busy; }
+function say(text) {
+  try { speechSynthesis.cancel(); speechSynthesis.speak(new SpeechSynthesisUtterance(text)); } catch (e) {}
+}
+function show(r, mode) {
+  lastReact = r;
+  $("answer").scrollIntoView({ block: "end" });
+  $("tag").textContent = r.type + " \u00b7 " + mode;
+  $("short").textContent = r.short;
+  $("long").textContent = r.long;
+  $("copy").classList.remove("hide"); $("again").classList.remove("hide");
+  session.unshift(r);
+  const h = $("hist"); h.innerHTML = "";
+  for (const x of session.slice(1, 10)) {
+    const d = document.createElement("div"); d.textContent = x.short;
+    d.onclick = () => show(x, "earlier");
+    h.appendChild(d);
+  }
+  $("histCard").style.display = session.length > 1 ? "" : "none";
+}
+
+function render() {
+  const ready = !!(KEYS && KEYS.o && KEYS.a);
+  $("setup").classList.toggle("hide", ready);
+  $("app").classList.toggle("hide", !ready);
+  $("start").classList.toggle("hide", !ready || !!stream);
+  $("triggers").classList.toggle("hide", !stream);
+}
+
+setInterval(() => {
+  $("meter").firstElementChild.style.width = Math.max(0, Math.min(100, (level + 60) * 1.8)) + "%";
+  $("buf").textContent = stream ? Math.floor(filled / SR) + " s" : "";
+}, 150);
+
+$("saveKeys").onclick = () => {
+  const o = $("kOpen").value.trim(), a = $("kAnth").value.trim();
+  if (!o || !a) return;
+  KEYS = { o, a };
+  localStorage.setItem("halo.keys", JSON.stringify(KEYS));
+  render();
+};
+async function micHelp(e) {
+  if (document.visibilityState !== "visible") return "The phone was locked. Unlock it and tap Start.";
+  if (/; wv\)/.test(navigator.userAgent)) return "This opened inside another app. Open it in Chrome instead.";
+  let perm = "unknown";
+  try { perm = (await navigator.permissions.query({ name: "microphone" })).state; } catch (x) {}
+  const name = e && e.name;
+  if (perm === "denied") return "Microphone is blocked for Halo. In Chrome, tap the icon left of the address, then Permissions, Microphone, Allow. In the installed app, long-press the Halo icon, App info, Permissions, Microphone, Allow. Then tap Start.";
+  if (name === "NotAllowedError") return "Android is blocking the microphone for Chrome. Open Settings, Apps, Chrome, Permissions, Microphone, and allow it while in use. Then tap Start.";
+  if (name === "NotFoundError") return "No microphone found. If you use the SmartMike+, connect it to this phone first.";
+  if (name === "NotReadableError") return "Another app is holding the microphone. Close it and tap Start.";
+  return "Microphone failed: " + (e.message || e);
+}
+async function begin(auto) {
+  try {
+    await startAudio();
+    if (ctx.state !== "running") throw Object.assign(new Error("Tap Start to begin."), { name: "NeedsTap" });
+    armMediaButtons();
+    keepAwake();
+    render();
+    status("Listening. Keep this screen open.");
+  } catch (e) {
+    if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+    render();
+    if (!auto) status(await micHelp(e), true);
+  }
+}
+$("start").onclick = () => begin(false);
+function autoStart() {
+  if (stream || !KEYS || document.visibilityState !== "visible" || !navigator.permissions) return;
+  navigator.permissions.query({ name: "microphone" })
+    .then(p => { if (p.state === "granted") begin(true); }).catch(() => {});
+}
+document.addEventListener("visibilitychange", autoStart);
+let installEvt = null;
+window.addEventListener("beforeinstallprompt", e => { e.preventDefault(); installEvt = e; $("install").classList.remove("hide"); });
+window.addEventListener("appinstalled", () => { $("install").classList.add("hide"); status("Installed. Open Halo from your home screen."); });
+$("install").onclick = async () => {
+  if (!installEvt) return;
+  installEvt.prompt();
+  await installEvt.userChoice;
+  installEvt = null;
+  $("install").classList.add("hide");
+};
+$("conv").onclick = () => trigger("conversation");
+$("cls").onclick = () => trigger("class");
+$("mic").onchange = switchMic;
+$("copy").onclick = () => lastReact && navigator.clipboard.writeText(lastReact.long).then(() => status("Copied."));
+$("again").onclick = () => lastReact && say(lastReact.short);
+$("speak").checked = localStorage.getItem("halo.speak") === "1";
+$("speak").onchange = e => localStorage.setItem("halo.speak", e.target.checked ? "1" : "0");
+// Off by default: the model is a one-time 1.3 GB download; the cloud stays the default until the phone wins.
+$("local").checked = localStorage.getItem("halo.local") === "1";
+$("local").onchange = e => {
+  localStorage.setItem("halo.local", e.target.checked ? "1" : "0");
+  if (e.target.checked) startLocal();
+};
+window.addEventListener("pagehide", () => { clearRing(); });
+window.haloDebug = () => ({ stt: sttState, note: sttNote, info: sttInfo, lastTap, total, segs: segs.length, pending: segs.filter(s => s.text === null).length, lastRun,
+  pieces: segs.map(s => [+(s.start / SR).toFixed(1), +(s.end / SR).toFixed(1), s.id, s.failed ? "FAILED" : s.text, s.cost || null]) });
+// Device tests: transcribe a Float32Array straight through the worker, bypassing the mic.
+let rawId = 0;
+window.haloSttRaw = (pcm, skip = 0, until = 0) => new Promise(res => {
+  const id = -(++rawId), f = Float32Array.from(pcm);
+  const h = e => { if (e.data.id === id) { stt.removeEventListener("message", h); res(e.data); } };
+  stt.addEventListener("message", h);
+  stt.postMessage({ kind: "seg", id, start: 0, end: f.length, pcm: f, skip, until }, [f.buffer]);
+});
+
+render();
+// The whisper build's model cache is dead weight now that Parakeet replaced it.
+try { caches.delete("transformers-cache"); } catch (e) {}
+if ($("local").checked) startLocal();
+autoStart();
+if (navigator.serviceWorker) navigator.serviceWorker.register("sw.js").catch(() => {});
+</script>
+</body>
+</html>
